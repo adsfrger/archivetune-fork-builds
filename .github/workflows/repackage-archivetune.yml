@@ -227,73 +227,106 @@ jobs:
 
           MANIFEST="decoded/AndroidManifest.xml"
 
-          test -f "$MANIFEST"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::AndroidManifest.xml not found"
+            exit 1
+          fi
 
           echo "=== Manifest BEFORE ==="
-          grep -nE \
-            'package=|android:authorities=|<permission|<uses-permission' \
-            "$MANIFEST" || true
+          grep -nE 'package=|android:authorities=|permission' "$MANIFEST" || true
 
           # ----------------------------------------------------------
-          # A. Android package ID
+          # 1. Manifest package
           # ----------------------------------------------------------
-          sed -i \
-            "s/package=\"${ORIGINAL_PACKAGE}\"/package=\"${NEW_PACKAGE}\"/" \
-            "$MANIFEST"
+          python3 - "$MANIFEST" "$ORIGINAL_PACKAGE" "$NEW_PACKAGE" <<'PY'
+          import sys
+
+          path = sys.argv[1]
+          old = sys.argv[2]
+          new = sys.argv[3]
+
+          with open(path, "r", encoding="utf-8") as f:
+              text = f.read()
+
+          old_manifest = f'package="{old}"'
+          new_manifest = f'package="{new}"'
+
+          if old_manifest not in text:
+              raise SystemExit(
+                  f'ERROR: Manifest package "{old}" was not found'
+              )
+
+          text = text.replace(old_manifest, new_manifest, 1)
 
           # ----------------------------------------------------------
-          # B. FileProvider authority
-          #
-          # アプリ固有のauthorityだけ変更する。
-          # クラス名は変更しない。
+          # FileProvider authority
           # ----------------------------------------------------------
-          OLD_ESCAPED="${ORIGINAL_PACKAGE//./\\.}"
+          text = text.replace(
+              f'{old}.fileprovider',
+              f'{new}.fileprovider'
+          )
 
-          sed -i \
-            "s/${OLD_ESCAPED}\.fileprovider/${NEW_PACKAGE}.fileprovider/g" \
-            "$MANIFEST"
-
-          # 大文字 FileProvider を使うパターンにも対応
-          sed -i \
-            "s/${OLD_ESCAPED}\.FileProvider/${NEW_PACKAGE}.FileProvider/g" \
-            "$MANIFEST"
+          text = text.replace(
+              f'{old}.FileProvider',
+              f'{new}.FileProvider'
+          )
 
           # ----------------------------------------------------------
-          # C. dynamic receiver permission
-          #
-          # これが本家とForkのインストール時競合を起こし得る。
+          # Dynamic receiver permission
           # ----------------------------------------------------------
-          sed -i \
-            "s/${OLD_ESCAPED}\.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION/${NEW_PACKAGE}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION/g" \
-            "$MANIFEST"
+          text = text.replace(
+              f'{old}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION',
+              f'{new}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
+          )
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(text)
+          PY
 
           # ----------------------------------------------------------
-          # D. app label
+          # 2. App label
           # ----------------------------------------------------------
           if [ -f decoded/res/values/strings.xml ]; then
-            sed -i \
-              "s#<string name=\"app_name\">[^<]*</string>#<string name=\"app_name\">${NEW_APP_LABEL}</string>#" \
-              decoded/res/values/strings.xml
+            python3 - "decoded/res/values/strings.xml" "$NEW_APP_LABEL" <<'PY'
+          import sys
+          import re
+
+          path = sys.argv[1]
+          label = sys.argv[2]
+
+          with open(path, "r", encoding="utf-8") as f:
+              text = f.read()
+
+          text, count = re.subn(
+              r'<string name="app_name">[^<]*</string>',
+              f'<string name="app_name">{label}</string>',
+              text,
+              count=1
+          )
+
+          if count:
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(text)
+          PY
           fi
 
           echo "=== Manifest AFTER ==="
-          grep -nE \
-            'package=|android:authorities=|<permission|<uses-permission' \
-            "$MANIFEST" || true
+          grep -nE 'package=|android:authorities=|permission' "$MANIFEST" || true
 
-          # package変更が実際に行われたことを確認
+          # ----------------------------------------------------------
+          # 3. Verify package change
+          # ----------------------------------------------------------
           if ! grep -q "package=\"${NEW_PACKAGE}\"" "$MANIFEST"; then
-            echo "::error::Manifest package was not changed."
+            echo "::error::Manifest package was not changed"
             exit 1
           fi
 
           if grep -q "package=\"${ORIGINAL_PACKAGE}\"" "$MANIFEST"; then
-            echo "::error::Original package still used as Manifest package."
+            echo "::error::Original package is still the Manifest package"
             exit 1
           fi
 
-          echo "Install identity patch OK."
-
+          echo "Install identity patch PASSED"
       # ============================================================
       # 9. Rebuild
       # ============================================================
@@ -314,30 +347,31 @@ jobs:
       # ============================================================
       - name: Verify rebuilt package
         if: steps.check.outputs.skip == 'false'
+        env:
+          NEW_PACKAGE: ${{ env.NEW_PACKAGE }}
         run: |
           set -euo pipefail
 
           BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
 
-          "$BT/aapt" dump badging unsigned.apk |
-            grep "^package:"
+          echo "=== Rebuilt APK package ==="
+
+          "$BT/aapt" dump badging unsigned.apk | grep '^package:'
 
           PACKAGE="$(
             "$BT/aapt" dump badging unsigned.apk |
-            sed -n "s/^package: name='\([^']*\)'.*/\1/p"
+            awk -F"'" '/^package:/{print $2; exit}'
           )"
 
-          echo "Rebuilt package: $PACKAGE"
+          echo "Detected package: $PACKAGE"
+          echo "Expected package: $NEW_PACKAGE"
 
-          if [ "$PACKAGE" != "${NEW_PACKAGE}" ]; then
-            echo "::error::Rebuilt APK has wrong package."
-            echo "Expected: ${NEW_PACKAGE}"
-            echo "Actual:   ${PACKAGE}"
+          if [ "$PACKAGE" != "$NEW_PACKAGE" ]; then
+            echo "::error::Wrong APK package"
             exit 1
           fi
 
-          echo "Package verification PASSED."
-
+          echo "Package verification PASSED"
       # ============================================================
       # 11. Keystore復元
       # ============================================================
@@ -392,6 +426,8 @@ jobs:
       # ============================================================
       - name: Final APK verification
         if: steps.check.outputs.skip == 'false'
+        env:
+          NEW_PACKAGE: ${{ env.NEW_PACKAGE }}
         run: |
           set -euo pipefail
 
@@ -400,32 +436,29 @@ jobs:
 
           echo "=== Final package ==="
 
-          "$BT/aapt" dump badging "$APK" |
-            grep "^package:"
+          "$BT/aapt" dump badging "$APK" | grep '^package:'
 
           PACKAGE="$(
             "$BT/aapt" dump badging "$APK" |
-            sed -n "s/^package: name='\([^']*\)'.*/\1/p"
+            awk -F"'" '/^package:/{print $2; exit}'
           )"
 
-          if [ "$PACKAGE" != "${NEW_PACKAGE}" ]; then
-            echo "::error::Final package is wrong."
+          echo "Detected package: $PACKAGE"
+
+          if [ "$PACKAGE" != "$NEW_PACKAGE" ]; then
+            echo "::error::Final package is wrong"
+            echo "Expected: $NEW_PACKAGE"
+            echo "Actual:   $PACKAGE"
             exit 1
           fi
 
           echo
           echo "=== Signature ==="
 
-          "$BT/apksigner" verify \
-            --verbose \
-            "$APK"
+          "$BT/apksigner" verify             --verbose             "$APK"
 
           echo
-          echo "========================================"
-          echo " ArchiveTune Fork verification PASSED"
-          echo " Package: $PACKAGE"
-          echo "========================================"
-
+          echo "Final APK verification PASSED"
       # ============================================================
       # 15. Release公開
       # ============================================================
