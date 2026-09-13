@@ -8,11 +8,11 @@ name: Repackage ArchiveTune Fork (Dual Install)
 
 on:
   schedule:
-    - cron: "0 * * * *"   # 1時間おきに上流の新リリースをチェック
+    - cron: "0 * * * *"    # 1時間おきに上流の新リリースをチェック
   workflow_dispatch: {}    # 手動実行ボタンでも起動可能
 
 env:
-  UPSTREAM_REPO: vossgraves/ArchiveTune   # 追従したいフォーク。本家を追いたい場合は rukamori/ArchiveTune に変更
+  UPSTREAM_REPO: vossgraves/ArchiveTune    # 追従したいフォーク。本家を追いたい場合は rukamori/ArchiveTune に変更
   ORIGINAL_PACKAGE: moe.rukamori.archivetune
   NEW_PACKAGE: moe.rukamori.archivetune.fork
   NEW_APP_LABEL: "ArchiveTune Fork"
@@ -64,9 +64,12 @@ jobs:
 
       - name: Install build-tools & apktool
         if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           sdkmanager "build-tools;34.0.0" --sdk_root="$ANDROID_SDK_ROOT"
-          curl -L -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar
+          APKTOOL_URL=$(curl -s https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | jq -r '[.assets[] | select(.name | test("\\.jar$"))][0].browser_download_url')
+          curl -sL -o apktool.jar "$APKTOOL_URL"
 
       - name: Decompile
         if: steps.check.outputs.skip == 'false'
