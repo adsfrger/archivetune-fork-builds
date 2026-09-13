@@ -1,18 +1,12 @@
 name: Repackage ArchiveTune Fork (Dual Install)
 
-# 目的:
-#   vossgraves/ArchiveTune (フォーク) の新しいリリースが出るたびに、
-#   パッケージ名を moe.rukamori.archivetune.fork に書き換えて再署名し、
-#   このリポジトリの Releases に自動で公開する。
-#   Obtainium にこのリポジトリを登録しておけば、以降は完全自動更新される。
-
 on:
   schedule:
     - cron: "0 * * * *"    # 1時間おきに上流の新リリースをチェック
   workflow_dispatch: {}    # 手動実行ボタンでも起動可能
 
 env:
-  UPSTREAM_REPO: vossgraves/ArchiveTune    # 追従したいフォーク。本家を追いたい場合は rukamori/ArchiveTune に変更
+  UPSTREAM_REPO: rukamori/ArchiveTune    # 本家リポジトリに変更
   ORIGINAL_PACKAGE: moe.rukamori.archivetune
   NEW_PACKAGE: moe.rukamori.archivetune.fork
   NEW_APP_LABEL: "ArchiveTune Fork"
@@ -20,6 +14,8 @@ env:
 jobs:
   repackage:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Find latest upstream release + APK asset
         id: upstream
