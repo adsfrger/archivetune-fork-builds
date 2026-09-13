@@ -515,7 +515,6 @@ jobs:
                   optimize=True,
               )
 
-              # Background color for the adaptive-icon wrapper.
               sample = canvas.resize(
                   (64, 64),
                   Image.Resampling.BILINEAR,
@@ -631,15 +630,6 @@ jobs:
               f"Embedded {len(files)} GitHub-hosted selectable Community Icons."
           )
           PY
-
-      # ============================================================
-      # IMPORTANT:
-      # Do NOT replace branding/icon.png.
-      #
-      # The upstream launcher icon remains the default icon.
-      # K.png (or any other user image) belongs in ICON_DIR and is
-      # therefore treated as a Community Icon.
-      # ============================================================
 
       - name: Rebuild APK
         if: steps.guard.outputs.run == 'true'
