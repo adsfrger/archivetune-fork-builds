@@ -1,0 +1,14 @@
+name: Keepalive Workflow
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"    # 毎月1日に実行
+  workflow_dispatch: {}
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: gautamkrishnar/keepalive-workflow@v2
