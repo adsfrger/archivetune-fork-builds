@@ -2,13 +2,18 @@ name: Repackage ArchiveTune Fork (Dual Install)
 
 on:
   schedule:
-    - cron: "0 * * * *"    # 1時間おきに上流の新リリースをチェック
-  workflow_dispatch: {}    # 手動実行
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
 
 env:
   UPSTREAM_REPO: rukamori/ArchiveTune
+
+  # 上流APKの package
   ORIGINAL_PACKAGE: moe.rukamori.archivetune
+
+  # Fork APKの package
   NEW_PACKAGE: moe.rukamori.archivetune.fork
+
   NEW_APP_LABEL: "ArchiveTune Fork"
 
 jobs:
@@ -20,7 +25,7 @@ jobs:
 
     steps:
       # ============================================================
-      # 1. 上流の最新リリースを取得
+      # 1. 最新の安定版Releaseを取得
       # ============================================================
       - name: Find latest upstream release + APK asset
         id: upstream
@@ -31,8 +36,10 @@ jobs:
 
           latest="$(
             curl -fsSL \
-              "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=5" \
-            | jq -c 'map(select(.draft == false and .prerelease == false))[0]'
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=10" |
+            jq -c '
+              map(select(.draft == false and .prerelease == false))[0]
+            '
           )"
 
           if [ "$latest" = "null" ] || [ -z "$latest" ]; then
@@ -42,6 +49,7 @@ jobs:
 
           tag="$(echo "$latest" | jq -r '.tag_name')"
 
+          # universal APKを優先
           apk_url="$(
             echo "$latest" |
             jq -r '
@@ -52,6 +60,7 @@ jobs:
             '
           )"
 
+          # なければ任意のAPK
           if [ "$apk_url" = "null" ] || [ -z "$apk_url" ]; then
             apk_url="$(
               echo "$latest" |
@@ -59,24 +68,23 @@ jobs:
                 [
                   .assets[]
                   | select(.name | test("\\.apk$"; "i"))
-                ][0].browser_download_url
-              '
+              ][0].browser_download_url
             )"
           fi
 
           if [ "$apk_url" = "null" ] || [ -z "$apk_url" ]; then
-            echo "::error::No APK asset found in upstream release $tag"
+            echo "::error::No APK asset found in release ${tag}"
             exit 1
           fi
 
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "apk_url=$apk_url" >> "$GITHUB_OUTPUT"
 
-          echo "Upstream release: $tag"
-          echo "APK URL: $apk_url"
+          echo "Release: $tag"
+          echo "APK: $apk_url"
 
       # ============================================================
-      # 2. すでに処理済みなら終了
+      # 2. 既に処理済みなら終了
       # ============================================================
       - name: Skip if this version was already repackaged
         id: check
@@ -90,14 +98,14 @@ jobs:
             --repo "${{ github.repository }}" >/dev/null 2>&1
           then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Release already exists. Skipping."
+            echo "Already repackaged. Skipping."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Release does not exist. Continuing."
+            echo "New version detected."
           fi
 
       # ============================================================
-      # 3. APKをダウンロード
+      # 3. APK取得
       # ============================================================
       - name: Download upstream APK
         if: steps.check.outputs.skip == 'false'
@@ -108,6 +116,7 @@ jobs:
             -o original.apk \
             "${{ steps.upstream.outputs.apk_url }}"
 
+          test -s original.apk
           ls -lh original.apk
 
       # ============================================================
@@ -121,13 +130,13 @@ jobs:
           distribution: "temurin"
 
       # ============================================================
-      # 5. Android SDK / Build Tools
+      # 5. Android SDK
       # ============================================================
-      - name: Set up Android build-tools
+      - name: Set up Android SDK
         if: steps.check.outputs.skip == 'false'
         uses: android-actions/setup-android@v3
 
-      - name: Install build-tools & apktool
+      - name: Install build-tools and apktool
         if: steps.check.outputs.skip == 'false'
         run: |
           set -euo pipefail
@@ -148,7 +157,7 @@ jobs:
           )"
 
           if [ "$APKTOOL_URL" = "null" ] || [ -z "$APKTOOL_URL" ]; then
-            echo "::error::Could not determine Apktool download URL."
+            echo "::error::Could not find Apktool."
             exit 1
           fi
 
@@ -159,36 +168,37 @@ jobs:
           java -jar apktool.jar --version
 
       # ============================================================
-      # 6. 元APKの package ID を確認
+      # 6. 上流APKのpackageを確認
       # ============================================================
-      - name: Inspect upstream APK package
+      - name: Verify upstream package
         if: steps.check.outputs.skip == 'false'
         run: |
           set -euo pipefail
 
           BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
 
-          echo "=== Upstream APK package ==="
-          "$BT/aapt" dump badging original.apk | grep "^package:"
+          echo "=== Upstream package ==="
+
+          "$BT/aapt" dump badging original.apk |
+            grep "^package:" || true
 
           PACKAGE="$(
             "$BT/aapt" dump badging original.apk |
             sed -n "s/^package: name='\([^']*\)'.*/\1/p"
           )"
 
-          echo "Detected upstream package: $PACKAGE"
+          echo "Detected: $PACKAGE"
+          echo "Expected: ${ORIGINAL_PACKAGE}"
 
           if [ "$PACKAGE" != "${ORIGINAL_PACKAGE}" ]; then
             echo "::error::Unexpected upstream package."
-            echo "Expected: ${ORIGINAL_PACKAGE}"
-            echo "Actual:   ${PACKAGE}"
             exit 1
           fi
 
       # ============================================================
       # 7. Decompile
       # ============================================================
-      - name: Decompile
+      - name: Decompile APK
         if: steps.check.outputs.skip == 'false'
         run: |
           set -euo pipefail
@@ -199,17 +209,14 @@ jobs:
             -f
 
       # ============================================================
-      # 8. Patch
+      # 8. パッケージ変更
       #
-      # 重要:
-      # - Manifest package
-      # - FileProvider authority
-      # - DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
-      # - app label
+      # 「必要なものだけ」変更する。
       #
-      # クラス名そのものは無差別置換しない
+      # Java/Kotlinクラス名は変更しない。
+      # Intent actionも変更しない。
       # ============================================================
-      - name: Patch package name, authorities, permissions & app label
+      - name: Patch install identity
         if: steps.check.outputs.skip == 'false'
         env:
           ORIGINAL_PACKAGE: ${{ env.ORIGINAL_PACKAGE }}
@@ -220,18 +227,15 @@ jobs:
 
           MANIFEST="decoded/AndroidManifest.xml"
 
-          if [ ! -f "$MANIFEST" ]; then
-            echo "::error::AndroidManifest.xml not found."
-            exit 1
-          fi
+          test -f "$MANIFEST"
 
-          echo "=== Manifest BEFORE patch ==="
+          echo "=== Manifest BEFORE ==="
           grep -nE \
-            'package=|android:name=|android:authorities=|<permission|<uses-permission' \
+            'package=|android:authorities=|<permission|<uses-permission' \
             "$MANIFEST" || true
 
           # ----------------------------------------------------------
-          # A. APK package / application ID
+          # A. Android package ID
           # ----------------------------------------------------------
           sed -i \
             "s/package=\"${ORIGINAL_PACKAGE}\"/package=\"${NEW_PACKAGE}\"/" \
@@ -239,48 +243,32 @@ jobs:
 
           # ----------------------------------------------------------
           # B. FileProvider authority
-          # ----------------------------------------------------------
-          sed -i \
-            "s/${ORIGINAL_PACKAGE//./\\.}\.fileprovider/${NEW_PACKAGE}.fileprovider/g" \
-            "$MANIFEST"
-
-          # 形式が異なる場合にも対応
-          sed -i \
-            "s/${ORIGINAL_PACKAGE//./\\.}:fileprovider/${NEW_PACKAGE}.fileprovider/g" \
-            "$MANIFEST"
-
-          # ----------------------------------------------------------
-          # C. App-specific dynamic receiver permission
           #
-          # 元:
-          # moe.rukamori.archivetune.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+          # アプリ固有のauthorityだけ変更する。
+          # クラス名は変更しない。
+          # ----------------------------------------------------------
+          OLD_ESCAPED="${ORIGINAL_PACKAGE//./\\.}"
+
+          sed -i \
+            "s/${OLD_ESCAPED}\.fileprovider/${NEW_PACKAGE}.fileprovider/g" \
+            "$MANIFEST"
+
+          # 大文字 FileProvider を使うパターンにも対応
+          sed -i \
+            "s/${OLD_ESCAPED}\.FileProvider/${NEW_PACKAGE}.FileProvider/g" \
+            "$MANIFEST"
+
+          # ----------------------------------------------------------
+          # C. dynamic receiver permission
           #
-          # 新:
-          # moe.rukamori.archivetune.fork.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+          # これが本家とForkのインストール時競合を起こし得る。
           # ----------------------------------------------------------
           sed -i \
-            "s/${ORIGINAL_PACKAGE//./\\.}\.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION/${NEW_PACKAGE}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION/g" \
+            "s/${OLD_ESCAPED}\.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION/${NEW_PACKAGE}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION/g" \
             "$MANIFEST"
 
           # ----------------------------------------------------------
-          # D. よくある app-specific permission / authority
-          #
-          # 旧 package 由来の明示的な permission/authority だけ変更。
-          # Activity/Service等のJavaクラス名は変更しない。
-          # ----------------------------------------------------------
-
-          # *.fileprovider
-          sed -i \
-            "s/${ORIGINAL_PACKAGE//./\\.}\.fileprovider/${NEW_PACKAGE}.fileprovider/g" \
-            "$MANIFEST"
-
-          # *.provider
-          sed -i \
-            "s/${ORIGINAL_PACKAGE//./\\.}\.provider/${NEW_PACKAGE}.provider/g" \
-            "$MANIFEST"
-
-          # ----------------------------------------------------------
-          # E. app label
+          # D. app label
           # ----------------------------------------------------------
           if [ -f decoded/res/values/strings.xml ]; then
             sed -i \
@@ -288,49 +276,26 @@ jobs:
               decoded/res/values/strings.xml
           fi
 
-          echo "=== Manifest AFTER patch ==="
+          echo "=== Manifest AFTER ==="
           grep -nE \
-            'package=|android:name=|android:authorities=|<permission|<uses-permission' \
+            'package=|android:authorities=|<permission|<uses-permission' \
             "$MANIFEST" || true
 
-          # ----------------------------------------------------------
-          # F. package変更が実際に行われたか検証
-          # ----------------------------------------------------------
+          # package変更が実際に行われたことを確認
           if ! grep -q "package=\"${NEW_PACKAGE}\"" "$MANIFEST"; then
             echo "::error::Manifest package was not changed."
             exit 1
           fi
 
           if grep -q "package=\"${ORIGINAL_PACKAGE}\"" "$MANIFEST"; then
-            echo "::error::Original package still exists as manifest package."
+            echo "::error::Original package still used as Manifest package."
             exit 1
           fi
 
-          echo "Manifest package patch verified."
+          echo "Install identity patch OK."
 
       # ============================================================
-      # 9. Manifestに残っている競合候補を表示
-      # ============================================================
-      - name: Inspect remaining old package references
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          MANIFEST="decoded/AndroidManifest.xml"
-
-          echo "=== Remaining references to original package in Manifest ==="
-
-          if grep -nF "${ORIGINAL_PACKAGE}" "$MANIFEST"; then
-            echo
-            echo "NOTE:"
-            echo "These references are intentionally NOT all replaced."
-            echo "Java/Kotlin class names may legitimately retain the original package."
-          else
-            echo "No original package references remain in Manifest."
-          fi
-
-      # ============================================================
-      # 10. Rebuild
+      # 9. Rebuild
       # ============================================================
       - name: Rebuild APK
         if: steps.check.outputs.skip == 'false'
@@ -341,69 +306,40 @@ jobs:
             b decoded \
             -o unsigned.apk
 
+          test -s unsigned.apk
           ls -lh unsigned.apk
 
       # ============================================================
-      # 11. 再ビルド後の APK package ID を検証
+      # 10. 再ビルド後の package IDを確認
       # ============================================================
-      - name: Verify rebuilt APK package
+      - name: Verify rebuilt package
         if: steps.check.outputs.skip == 'false'
         run: |
           set -euo pipefail
 
           BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
 
-          echo "=== Rebuilt APK package ==="
-
-          "$BT/aapt" dump badging unsigned.apk | grep "^package:"
+          "$BT/aapt" dump badging unsigned.apk |
+            grep "^package:"
 
           PACKAGE="$(
             "$BT/aapt" dump badging unsigned.apk |
             sed -n "s/^package: name='\([^']*\)'.*/\1/p"
           )"
 
-          echo "Detected rebuilt package: $PACKAGE"
+          echo "Rebuilt package: $PACKAGE"
 
           if [ "$PACKAGE" != "${NEW_PACKAGE}" ]; then
-            echo "::error::Wrong APK package."
+            echo "::error::Rebuilt APK has wrong package."
             echo "Expected: ${NEW_PACKAGE}"
             echo "Actual:   ${PACKAGE}"
             exit 1
           fi
 
-          echo "APK package verification PASSED."
+          echo "Package verification PASSED."
 
       # ============================================================
-      # 12. 競合しそうな permission / authority を確認
-      # ============================================================
-      - name: Verify dual-install identifiers
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
-
-          echo "=== APK permission / provider information ==="
-
-          "$BT/aapt" dump xmltree unsigned.apk AndroidManifest.xml \
-            | grep -E \
-              'permission|uses-permission|authorities|DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION' \
-              || true
-
-          echo
-          echo "Expected unique package:"
-          echo "${NEW_PACKAGE}"
-
-          echo
-          echo "Expected unique FileProvider authority:"
-          echo "${NEW_PACKAGE}.fileprovider"
-
-          echo
-          echo "Expected unique dynamic receiver permission:"
-          echo "${NEW_PACKAGE}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
-
-      # ============================================================
-      # 13. Keystore
+      # 11. Keystore復元
       # ============================================================
       - name: Restore signing key
         if: steps.check.outputs.skip == 'false'
@@ -416,9 +352,9 @@ jobs:
           test -s release.jks
 
       # ============================================================
-      # 14. zipalign
+      # 12. zipalign
       # ============================================================
-      - name: zipalign
+      - name: Zipalign
         if: steps.check.outputs.skip == 'false'
         run: |
           set -euo pipefail
@@ -433,7 +369,7 @@ jobs:
             aligned.apk
 
       # ============================================================
-      # 15. Sign
+      # 13. Sign
       # ============================================================
       - name: Sign APK
         if: steps.check.outputs.skip == 'false'
@@ -441,17 +377,20 @@ jobs:
           set -euo pipefail
 
           BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
+          OUTPUT="ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk"
 
           "$BT/apksigner" sign \
             --ks release.jks \
             --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
-            --out "ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk" \
+            --out "$OUTPUT" \
             aligned.apk
 
+          test -s "$OUTPUT"
+
       # ============================================================
-      # 16. Signed APKの最終検証
+      # 14. 最終検証
       # ============================================================
-      - name: Verify signed APK
+      - name: Final APK verification
         if: steps.check.outputs.skip == 'false'
         run: |
           set -euo pipefail
@@ -459,9 +398,10 @@ jobs:
           BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
           APK="ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk"
 
-          echo "=== Final APK package ==="
+          echo "=== Final package ==="
 
-          "$BT/aapt" dump badging "$APK" | grep "^package:"
+          "$BT/aapt" dump badging "$APK" |
+            grep "^package:"
 
           PACKAGE="$(
             "$BT/aapt" dump badging "$APK" |
@@ -469,20 +409,25 @@ jobs:
           )"
 
           if [ "$PACKAGE" != "${NEW_PACKAGE}" ]; then
-            echo "::error::Final signed APK has wrong package: $PACKAGE"
+            echo "::error::Final package is wrong."
             exit 1
           fi
 
           echo
-          echo "=== APK signature ==="
-          "$BT/apksigner" verify --verbose "$APK"
+          echo "=== Signature ==="
+
+          "$BT/apksigner" verify \
+            --verbose \
+            "$APK"
 
           echo
-          echo "Final verification PASSED."
-          echo "Package: $PACKAGE"
+          echo "========================================"
+          echo " ArchiveTune Fork verification PASSED"
+          echo " Package: $PACKAGE"
+          echo "========================================"
 
       # ============================================================
-      # 17. Release公開
+      # 15. Release公開
       # ============================================================
       - name: Publish to this repo's Releases
         if: steps.check.outputs.skip == 'false'
