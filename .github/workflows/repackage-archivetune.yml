@@ -1,0 +1,118 @@
+name: Repackage ArchiveTune Fork (Dual Install)
+
+# 目的:
+#   vossgraves/ArchiveTune (フォーク) の新しいリリースが出るたびに、
+#   パッケージ名を moe.rukamori.archivetune.fork に書き換えて再署名し、
+#   このリポジトリの Releases に自動で公開する。
+#   Obtainium にこのリポジトリを登録しておけば、以降は完全自動更新される。
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # 1時間おきに上流の新リリースをチェック
+  workflow_dispatch: {}    # 手動実行ボタンでも起動可能
+
+env:
+  UPSTREAM_REPO: vossgraves/ArchiveTune   # 追従したいフォーク。本家を追いたい場合は rukamori/ArchiveTune に変更
+  ORIGINAL_PACKAGE: moe.rukamori.archivetune
+  NEW_PACKAGE: moe.rukamori.archivetune.fork
+  NEW_APP_LABEL: "ArchiveTune Fork"
+
+jobs:
+  repackage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find latest upstream release + APK asset
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          latest=$(curl -s "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=5" | jq -c '[.[]][0]')
+          tag=$(echo "$latest" | jq -r '.tag_name')
+          apk_url=$(echo "$latest" | jq -r '[.assets[] | select(.name | test("universal.*\\.apk$"; "i"))][0].browser_download_url')
+          if [ "$apk_url" = "null" ] || [ -z "$apk_url" ]; then
+            apk_url=$(echo "$latest" | jq -r '[.assets[] | select(.name | test("\\.apk$"))][0].browser_download_url')
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "apk_url=$apk_url" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this version was already repackaged
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download upstream APK
+        if: steps.check.outputs.skip == 'false'
+        run: curl -L -o original.apk "${{ steps.upstream.outputs.apk_url }}"
+
+      - name: Set up JDK 17
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Set up Android build-tools (for zipalign / apksigner)
+        if: steps.check.outputs.skip == 'false'
+        uses: android-actions/setup-android@v3
+
+      - name: Install build-tools & apktool
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          sdkmanager "build-tools;34.0.0" --sdk_root="$ANDROID_SDK_ROOT"
+          curl -L -o apktool.jar https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar
+
+      - name: Decompile
+        if: steps.check.outputs.skip == 'false'
+        run: java -jar apktool.jar d original.apk -o decoded -f
+
+      - name: Patch package name & app label
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          set -e
+          MANIFEST=decoded/AndroidManifest.xml
+          sed -i "s/package=\"${ORIGINAL_PACKAGE}\"/package=\"${NEW_PACKAGE}\"/" "$MANIFEST"
+          # FileProvider などが旧パッケージ名を明示参照している箇所も書き換え
+          sed -i "s/${ORIGINAL_PACKAGE//./\\.}\\.fileprovider/${NEW_PACKAGE}.fileprovider/g" "$MANIFEST"
+          # ホーム画面で見分けられるようアプリ名を変更(strings.xml の app_name を上書き)
+          if [ -f decoded/res/values/strings.xml ]; then
+            sed -i "s#<string name=\"app_name\">[^<]*</string>#<string name=\"app_name\">${NEW_APP_LABEL}</string>#" decoded/res/values/strings.xml
+          fi
+
+      - name: Rebuild APK
+        if: steps.check.outputs.skip == 'false'
+        run: java -jar apktool.jar b decoded -o unsigned.apk
+
+      - name: Restore signing key
+        if: steps.check.outputs.skip == 'false'
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.jks
+
+      - name: zipalign
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
+          "$BT/zipalign" -p -f 4 unsigned.apk aligned.apk
+
+      - name: Sign APK
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
+          "$BT/apksigner" sign \
+            --ks release.jks \
+            --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
+            --out "ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk" \
+            aligned.apk
+
+      - name: Publish to this repo's Releases
+        if: steps.check.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          name: "ArchiveTune Fork ${{ steps.upstream.outputs.tag }}"
+          files: ArchiveTuneFork-*.apk
