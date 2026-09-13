@@ -8,10 +8,10 @@ on:
 env:
   UPSTREAM_REPO: rukamori/ArchiveTune
 
-  # 上流APKの package
+  # Upstream APK package
   ORIGINAL_PACKAGE: moe.rukamori.archivetune
 
-  # Fork APKの package
+  # Fork APK package
   NEW_PACKAGE: moe.rukamori.archivetune.fork
 
   NEW_APP_LABEL: "AT-Fork"
@@ -25,18 +25,14 @@ jobs:
 
     steps:
       # ============================================================
-      # 1. 最新の安定版Releaseを取得し、正しいアセットを選ぶ
+      # 1. Find latest stable upstream GMS mobile APK.
       #
-      # ArchiveTuneには GMS版(Cast/GoogleSignIn等を含む) と
-      # FOSS版(それらを除いたビルド)、さらに mobile版/tv版が
-      # 混在してリリースされている。
+      # Priority:
+      #   1. app-gms-mobile-universal-release.apk
+      #   2. app-gms-mobile-arm64-release.apk
+      #   3. any other app-gms-mobile-*.apk
       #
-      # 優先順位:
-      #   1. app-gms-mobile-universal-release.apk (全ABI・GMS機能フル)
-      #   2. app-gms-mobile-arm64-release.apk      (universalが無い場合の保険)
-      #   3. それ以外の app-gms-mobile-*.apk        (さらに保険)
-      #
-      # foss / tv は絶対に選ばない。
+      # FOSS / TV are never selected.
       # ============================================================
       - name: Find latest upstream release + APK asset
         id: upstream
@@ -89,12 +85,13 @@ jobs:
           echo "Release: $tag"
           echo "Selected asset: $apk_name"
           echo "APK: $apk_url"
+
           if [ -n "$apk_digest" ]; then
             echo "Expected digest: $apk_digest"
           fi
 
       # ============================================================
-      # 2. 既に処理済みなら終了
+      # 2. Skip versions already published by this fork.
       # ============================================================
       - name: Skip if this version was already repackaged
         id: check
@@ -115,7 +112,7 @@ jobs:
           fi
 
       # ============================================================
-      # 3. APK取得 + 整合性検証
+      # 3. Download + integrity check.
       # ============================================================
       - name: Download upstream APK
         if: steps.check.outputs.skip == 'false'
@@ -136,10 +133,12 @@ jobs:
             ACTUAL="sha256:$(sha256sum original.apk | awk '{print $1}')"
             echo "Expected: $EXPECTED"
             echo "Actual:   $ACTUAL"
+
             if [ "$EXPECTED" != "$ACTUAL" ]; then
-              echo "::error::SHA256 mismatch! Download may be corrupted or tampered."
+              echo "::error::SHA256 mismatch."
               exit 1
             fi
+
             echo "Checksum verification PASSED."
           else
             echo "No digest metadata from GitHub API; skipping checksum verification."
@@ -156,7 +155,7 @@ jobs:
           distribution: "temurin"
 
       # ============================================================
-      # 5. Android SDK
+      # 5. Android SDK + Apktool
       # ============================================================
       - name: Set up Android SDK
         if: steps.check.outputs.skip == 'false'
@@ -194,7 +193,7 @@ jobs:
           java -jar apktool.jar --version
 
       # ============================================================
-      # 6. 上流APKのpackageを確認
+      # 6. Verify upstream package.
       # ============================================================
       - name: Verify upstream package
         if: steps.check.outputs.skip == 'false'
@@ -202,11 +201,6 @@ jobs:
           set -euo pipefail
 
           BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
-
-          echo "=== Upstream package ==="
-
-          "$BT/aapt" dump badging original.apk |
-            grep "^package:" || true
 
           PACKAGE="$(
             "$BT/aapt" dump badging original.apk |
@@ -222,7 +216,7 @@ jobs:
           fi
 
       # ============================================================
-      # 7. Decompile
+      # 7. Decompile.
       # ============================================================
       - name: Decompile APK
         if: steps.check.outputs.skip == 'false'
@@ -235,14 +229,35 @@ jobs:
             -f
 
       # ============================================================
-      # 8. パッケージ変更
+      # 8. Patch install identity.
       #
-      # 「必要なものだけ」変更する。
+      # IMPORTANT:
+      # ArchiveTune's community icon system generates:
       #
-      # Java/Kotlinクラス名は変更しない。
-      # Intent actionも変更しない。
+      #   catalog.json:
+      #     aliasClassName = <applicationId>.launcher.IconAlias<hash>
+      #
+      # and a matching manifest alias with the same applicationId.
+      #
+      # The old workflow changed only the manifest package, leaving
+      # catalog.json pointing at moe.rukamori.archivetune.*.
+      # That makes community icon selection resolve to the wrong
+      # package namespace and is the reason the icons cannot be used
+      # correctly in the fork.
+      #
+      # We therefore patch BOTH:
+      #   A. manifest package / provider / permission references
+      #   B. icon_pack/catalog.json aliasClassName
+      #   C. generated launcher aliases in the manifest
+      #
+      # We DO NOT rename Kotlin/Java class packages.
+      # This is intentional: Android component classes remain valid
+      # because normal app components are referenced relative to the
+      # manifest/application package, while IconAlias names are
+      # generated as fully-qualified component class names and must
+      # match the new package ID exactly.
       # ============================================================
-      - name: Patch install identity
+      - name: Patch install identity + community icon namespace
         if: steps.check.outputs.skip == 'false'
         env:
           ORIGINAL_PACKAGE: ${{ env.ORIGINAL_PACKAGE }}
@@ -252,49 +267,88 @@ jobs:
           set -euo pipefail
 
           MANIFEST="decoded/AndroidManifest.xml"
+          CATALOG="decoded/assets/icon_pack/catalog.json"
 
           test -f "$MANIFEST"
+          test -f "$CATALOG"
 
-          echo "=== Manifest BEFORE ==="
+          OLD_ESCAPED="${ORIGINAL_PACKAGE//./\\.}"
+
+          echo "=== BEFORE: package-related lines ==="
           grep -nE \
-            'package=|android:authorities=|<permission|<uses-permission' \
+            'package=|android:authorities=|<permission|android:permission=|IconAlias|DefaultIconAlias' \
             "$MANIFEST" || true
 
+          echo "=== BEFORE: catalog alias namespace ==="
+          grep -o '"aliasClassName"[[:space:]]*:[[:space:]]*"[^"]*"' "$CATALOG" | head -20 || true
+
           # ----------------------------------------------------------
-          # A. Android package ID
+          # A. Manifest package.
           # ----------------------------------------------------------
           sed -i \
             "s/package=\"${ORIGINAL_PACKAGE}\"/package=\"${NEW_PACKAGE}\"/" \
             "$MANIFEST"
 
-          OLD_ESCAPED="${ORIGINAL_PACKAGE//./\\.}"
-
           # ----------------------------------------------------------
-          # B. Provider authority (行単位の汎用置換)
-          #
-          # fileprovider, androidx-startup, WorkManagerのInitializer等、
-          # ContentProviderのauthorityは端末内でユニークである必要があるため、
-          # android:authorities= を含む行だけ丸ごと対象にする。
+          # B. Provider authorities and permission namespaces.
           # ----------------------------------------------------------
           sed -i \
-            "/android:authorities=/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g" \
+            "/android:authorities=/ s/${OLD_ESCAPED}\\./${NEW_PACKAGE}./g" \
+            "$MANIFEST"
+
+          sed -i \
+            "/<permission\\b/ s/${OLD_ESCAPED}\\./${NEW_PACKAGE}./g; \
+             /<uses-permission\\b/ s/${OLD_ESCAPED}\\./${NEW_PACKAGE}./g; \
+             /android:permission=/ s/${OLD_ESCAPED}\\./${NEW_PACKAGE}./g" \
             "$MANIFEST"
 
           # ----------------------------------------------------------
-          # C. 独自パーミッション (行単位の汎用置換)
+          # C. Community icon catalog.
           #
-          # DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION などAndroidXが自動生成する
-          # 独自パーミッションは、本家とFork双方が同名で宣言すると
-          # INSTALL_FAILED_DUPLICATE_PERMISSION でどちらかのインストールが失敗する。
+          # This is the critical missing patch in the old workflow.
+          # The catalog is runtime data, not merely documentation.
           # ----------------------------------------------------------
-          sed -i \
-            "/<permission\b/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g; \
-             /<uses-permission\b/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g; \
-             /android:permission=/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g" \
-            "$MANIFEST"
+          python3 - "$CATALOG" "$ORIGINAL_PACKAGE" "$NEW_PACKAGE" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          catalog_path = Path(sys.argv[1])
+          old_package = sys.argv[2]
+          new_package = sys.argv[3]
+
+          data = json.loads(catalog_path.read_text(encoding="utf-8"))
+
+          if not isinstance(data, list):
+              raise SystemExit("catalog.json must contain a JSON array")
+
+          changed = 0
+
+          for entry in data:
+              if not isinstance(entry, dict):
+                  raise SystemExit("catalog.json contains a non-object entry")
+
+              alias = entry.get("aliasClassName")
+              if isinstance(alias, str) and alias.startswith(old_package + "."):
+                  entry["aliasClassName"] = new_package + alias[len(old_package):]
+                  changed += 1
+
+          if changed == 0:
+              raise SystemExit(
+                  f"No catalog aliasClassName entries used {old_package}. "
+                  "Refusing to silently continue."
+              )
+
+          catalog_path.write_text(
+              json.dumps(data, ensure_ascii=False, indent=4) + "\n",
+              encoding="utf-8",
+          )
+
+          print(f"Patched {changed} catalog aliasClassName entries.")
+          PY
 
           # ----------------------------------------------------------
-          # D. app label (全ロケールのstrings.xmlに反映)
+          # D. App label for every locale.
           # ----------------------------------------------------------
           while IFS= read -r -d '' f; do
             if grep -q '<string name="app_name">' "$f"; then
@@ -304,26 +358,41 @@ jobs:
             fi
           done < <(find decoded/res -type f -name strings.xml -print0)
 
-          echo "=== Manifest AFTER ==="
-          grep -nE \
-            'package=|android:authorities=|<permission|<uses-permission' \
-            "$MANIFEST" || true
-
-          # package変更が実際に行われたことを確認
+          # ----------------------------------------------------------
+          # E. Validate package + catalog consistency.
+          # ----------------------------------------------------------
           if ! grep -q "package=\"${NEW_PACKAGE}\"" "$MANIFEST"; then
             echo "::error::Manifest package was not changed."
             exit 1
           fi
 
           if grep -q "package=\"${ORIGINAL_PACKAGE}\"" "$MANIFEST"; then
-            echo "::error::Original package still used as Manifest package."
+            echo "::error::Original package still exists as manifest package."
             exit 1
           fi
 
-          echo "Install identity patch OK."
+          if grep -q "\"aliasClassName\".*\"${ORIGINAL_PACKAGE}\\.launcher\\." "$CATALOG"; then
+            echo "::error::Catalog still contains original icon alias package."
+            exit 1
+          fi
+
+          if ! grep -q "\"aliasClassName\".*\"${NEW_PACKAGE}\\.launcher\\." "$CATALOG"; then
+            echo "::error::Catalog does not contain fork icon alias package."
+            exit 1
+          fi
+
+          echo "=== AFTER: package-related lines ==="
+          grep -nE \
+            'package=|android:authorities=|<permission|android:permission=|IconAlias|DefaultIconAlias' \
+            "$MANIFEST" || true
+
+          echo "=== AFTER: catalog alias namespace ==="
+          grep -o '"aliasClassName"[[:space:]]*:[[:space:]]*"[^"]*"' "$CATALOG" | head -20 || true
+
+          echo "Install identity + community icon namespace patch PASSED."
 
       # ============================================================
-      # 9. Rebuild
+      # 9. Rebuild.
       # ============================================================
       - name: Rebuild APK
         if: steps.check.outputs.skip == 'false'
@@ -338,7 +407,7 @@ jobs:
           ls -lh unsigned.apk
 
       # ============================================================
-      # 10. 再ビルド後の package IDを確認
+      # 10. Verify rebuilt package.
       # ============================================================
       - name: Verify rebuilt package
         if: steps.check.outputs.skip == 'false'
@@ -367,7 +436,7 @@ jobs:
           echo "Package verification PASSED."
 
       # ============================================================
-      # 11. GMS機能(Cast/SignIn)がちゃんと含まれているか確認
+      # 11. Verify GMS build characteristics.
       # ============================================================
       - name: Verify GMS features are present
         if: steps.check.outputs.skip == 'false'
@@ -376,16 +445,43 @@ jobs:
 
           MANIFEST="decoded/AndroidManifest.xml"
 
-          if ! grep -q "com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME" "$MANIFEST"; then
+          if ! grep -q \
+            "com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME" \
+            "$MANIFEST"
+          then
             echo "::error::Cast support is missing from this build."
-            echo "::error::Check that the selected upstream asset is the GMS variant, not FOSS."
+            echo "::error::The selected asset may not be the GMS variant."
             exit 1
           fi
 
           echo "GMS Cast support confirmed present."
 
       # ============================================================
-      # 12. Keystore復元
+      # 12. Verify icon catalog AFTER rebuild source patch.
+      # ============================================================
+      - name: Verify community icon catalog
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+
+          if ! unzip -p unsigned.apk assets/icon_pack/catalog.json |
+            grep -q "\"aliasClassName\".*\"${NEW_PACKAGE}\\.launcher\\."
+          then
+            echo "::error::Community icon catalog still points outside the fork package."
+            exit 1
+          fi
+
+          if unzip -p unsigned.apk assets/icon_pack/catalog.json |
+            grep -q "\"aliasClassName\".*\"${ORIGINAL_PACKAGE}\\.launcher\\."
+          then
+            echo "::error::Original community icon alias namespace remains in final APK."
+            exit 1
+          fi
+
+          echo "Community icon catalog verification PASSED."
+
+      # ============================================================
+      # 13. Restore signing key.
       # ============================================================
       - name: Restore signing key
         if: steps.check.outputs.skip == 'false'
@@ -398,7 +494,7 @@ jobs:
           test -s release.jks
 
       # ============================================================
-      # 13. zipalign
+      # 14. Zipalign.
       # ============================================================
       - name: Zipalign
         if: steps.check.outputs.skip == 'false'
@@ -415,7 +511,7 @@ jobs:
             aligned.apk
 
       # ============================================================
-      # 14. Sign
+      # 15. Sign.
       # ============================================================
       - name: Sign APK
         if: steps.check.outputs.skip == 'false'
@@ -434,7 +530,7 @@ jobs:
           test -s "$OUTPUT"
 
       # ============================================================
-      # 15. 最終検証
+      # 16. Final APK verification.
       # ============================================================
       - name: Final APK verification
         if: steps.check.outputs.skip == 'false'
@@ -442,39 +538,51 @@ jobs:
           set -euo pipefail
 
           BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
-          APK="ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk"
+          OUTPUT="ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk"
 
-          echo "=== Final package ==="
-
-          "$BT/aapt" dump badging "$APK" |
-            grep "^package:"
+          "$BT/apksigner" verify --verbose "$OUTPUT"
 
           PACKAGE="$(
-            "$BT/aapt" dump badging "$APK" |
+            "$BT/aapt" dump badging "$OUTPUT" |
             sed -n "s/^package: name='\([^']*\)'.*/\1/p"
           )"
 
+          LABEL="$(
+            "$BT/aapt" dump badging "$OUTPUT" |
+            sed -n "s/.*application-label:'\([^']*\)'.*/\1/p"
+          )"
+
+          echo "Final package: $PACKAGE"
+          echo "Final label:   $LABEL"
+
           if [ "$PACKAGE" != "${NEW_PACKAGE}" ]; then
-            echo "::error::Final package is wrong."
+            echo "::error::Final APK package is wrong."
             exit 1
           fi
 
-          echo
-          echo "=== Signature ==="
+          if [ "$LABEL" != "${NEW_APP_LABEL}" ]; then
+            echo "::error::Final APK label is wrong."
+            exit 1
+          fi
 
-          "$BT/apksigner" verify \
-            --verbose \
-            "$APK"
+          echo "=== Final community icon catalog ==="
+          unzip -p "$OUTPUT" assets/icon_pack/catalog.json |
+            grep -o '"aliasClassName"[[:space:]]*:[[:space:]]*"[^"]*"' |
+            head -20
 
-          echo
-          echo "========================================"
-          echo " ArchiveTune Fork verification PASSED"
-          echo " Source asset: ${{ steps.upstream.outputs.apk_name }}"
-          echo " Package: $PACKAGE"
-          echo "========================================"
+          if unzip -p "$OUTPUT" assets/icon_pack/catalog.json |
+            grep -q "\"aliasClassName\".*\"${ORIGINAL_PACKAGE}\\.launcher\\."
+          then
+            echo "::error::Original package remains in final community icon catalog."
+            exit 1
+          fi
+
+          echo "Final APK verification PASSED."
+
+          sha256sum "$OUTPUT" | tee final-sha256.txt
 
       # ============================================================
-      # 16. Release公開
+      # 17. Publish release.
       # ============================================================
       - name: Publish to this repo's Releases
         if: steps.check.outputs.skip == 'false'
@@ -483,6 +591,21 @@ jobs:
           tag_name: ${{ steps.upstream.outputs.tag }}
           name: "ArchiveTune Fork ${{ steps.upstream.outputs.tag }}"
           body: |
-            Repackaged from upstream asset: `${{ steps.upstream.outputs.apk_name }}`
+            Repackaged from upstream asset:
+            `${{ steps.upstream.outputs.apk_name }}`
+
+            Upstream repository:
+            https://github.com/rukamori/ArchiveTune
+
+            Fork package:
+            `${{ env.NEW_PACKAGE }}`
+
+            Community icon catalog namespace:
+            `${{ env.NEW_PACKAGE }}.launcher.*`
+
+            This build keeps the upstream GMS mobile APK contents and changes
+            only the installation identity / app label / package-dependent
+            runtime icon alias namespace required for dual installation.
           files: |
             ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk
+            final-sha256.txt
