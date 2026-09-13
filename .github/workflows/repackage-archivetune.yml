@@ -411,40 +411,71 @@ jobs:
 
           tree = ET.parse(manifest_path)
           root = tree.getroot()
-          application = root.find("application")
+
+          def local_name(tag):
+              return tag.rsplit("}", 1)[-1]
+
+          application = next(
+              (element for element in root.iter() if local_name(element.tag) == "application"),
+              None,
+          )
 
           if application is None:
               raise SystemExit(
                   "AndroidManifest.xml has no <application>"
               )
 
-          target_activity = None
-
-          for activity in application.findall("activity"):
+          def has_main_launcher(element):
               has_main = False
               has_launcher = False
 
-              for intent_filter in activity.findall("intent-filter"):
-                  for action in intent_filter.findall("action"):
-                      if action.get(ANDROID + "name") == \
-                              "android.intent.action.MAIN":
-                          has_main = True
+              for child in element.iter():
+                  if local_name(child.tag) == "action" and child.get(ANDROID + "name") == \
+                          "android.intent.action.MAIN":
+                      has_main = True
+                  elif local_name(child.tag) == "category" and child.get(ANDROID + "name") == \
+                          "android.intent.category.LAUNCHER":
+                      has_launcher = True
 
-                  for category in intent_filter.findall("category"):
-                      if category.get(ANDROID + "name") == \
-                              "android.intent.category.LAUNCHER":
-                          has_launcher = True
+              return has_main and has_launcher
 
-              if has_main and has_launcher:
-                  target_activity = activity.get(ANDROID + "name")
-                  break
+          target_activity = None
+          launcher_elements = []
+
+          # Some Android apps expose the launcher through an <activity-alias>
+          # instead of putting MAIN/LAUNCHER directly on the <activity>.
+          # Prefer a real activity, then fall back to the alias targetActivity.
+          for element in application.iter():
+              kind = local_name(element.tag)
+              if kind not in {"activity", "activity-alias"}:
+                  continue
+              if not has_main_launcher(element):
+                  continue
+
+              name = element.get(ANDROID + "name", "")
+              launcher_elements.append((kind, name))
+
+              if kind == "activity":
+                  target_activity = name or None
+                  if target_activity:
+                      break
+
+              alias_target = element.get(ANDROID + "targetActivity", "")
+              if alias_target and target_activity is None:
+                  target_activity = alias_target
 
           if not target_activity:
+              details = ", ".join(
+                  f"{kind}:{name or '<unnamed>'}"
+                  for kind, name in launcher_elements
+              ) or "none"
               raise SystemExit(
-                  "Could not find the existing MAIN/LAUNCHER activity"
+                  "Could not find an existing MAIN/LAUNCHER component; "
+                  f"candidates={details}"
               )
 
           print(f"Icon target activity: {target_activity}")
+          print(f"MAIN/LAUNCHER candidates: {launcher_elements or 'none'}")
 
           existing_ids = {
               entry.get("id")
@@ -760,7 +791,13 @@ jobs:
               Path("decoded/AndroidManifest.xml")
           ).getroot()
 
-          application = root.find("application")
+          def local_name(tag):
+              return tag.rsplit("}", 1)[-1]
+
+          application = next(
+              (element for element in root.iter() if local_name(element.tag) == "application"),
+              None,
+          )
 
           if application is None:
               raise SystemExit("ERROR: no <application>")
@@ -768,8 +805,8 @@ jobs:
           fork_aliases = []
           upstream_aliases = []
 
-          for element in application:
-              if element.tag != "activity-alias":
+          for element in application.iter():
+              if local_name(element.tag) != "activity-alias":
                   continue
 
               name = element.get(android + "name", "")
