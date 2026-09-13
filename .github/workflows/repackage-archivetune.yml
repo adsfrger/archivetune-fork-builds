@@ -1,472 +1,132 @@
 name: Repackage ArchiveTune Fork (Dual Install)
-
-on:
+true:
   schedule:
-    - cron: "0 * * * *"
+  - cron: 0 * * * *
   workflow_dispatch: {}
-
 env:
   UPSTREAM_REPO: rukamori/ArchiveTune
-
-  # 上流APKの package
   ORIGINAL_PACKAGE: moe.rukamori.archivetune
-
-  # Fork APKの package
   NEW_PACKAGE: moe.rukamori.archivetune.fork
-
-  NEW_APP_LABEL: "ArchiveTune Fork"
-
+  NEW_APP_LABEL: ArchiveTune Fork
 jobs:
   repackage:
     runs-on: ubuntu-latest
-
     permissions:
       contents: write
-
     steps:
-      # ============================================================
-      # 1. 最新の安定版Releaseを取得
-      # ============================================================
-      - name: Find latest upstream release + APK asset
-        id: upstream
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          latest="$(
-            curl -fsSL \
-              "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=10" |
-            jq -c '
-              map(select(.draft == false and .prerelease == false))[0]
-            '
-          )"
-
-          if [ "$latest" = "null" ] || [ -z "$latest" ]; then
-            echo "::error::No stable upstream release found."
-            exit 1
-          fi
-
-          tag="$(echo "$latest" | jq -r '.tag_name')"
-
-          # universal APKを優先
-          apk_url="$(
-            echo "$latest" |
-            jq -r '
-              [
-                .assets[]
-                | select(.name | test("universal.*\\.apk$"; "i"))
-              ][0].browser_download_url
-            '
-          )"
-
-          # なければ任意のAPK
-          if [ "$apk_url" = "null" ] || [ -z "$apk_url" ]; then
-            apk_url="$(
-              echo "$latest" |
-              jq -r '
-                [
-                  .assets[]
-                  | select(.name | test("\\.apk$"; "i"))
-              ][0].browser_download_url
-            )"
-          fi
-
-          if [ "$apk_url" = "null" ] || [ -z "$apk_url" ]; then
-            echo "::error::No APK asset found in release ${tag}"
-            exit 1
-          fi
-
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "apk_url=$apk_url" >> "$GITHUB_OUTPUT"
-
-          echo "Release: $tag"
-          echo "APK: $apk_url"
-
-      # ============================================================
-      # 2. 既に処理済みなら終了
-      # ============================================================
-      - name: Skip if this version was already repackaged
-        id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          if gh release view \
-            "${{ steps.upstream.outputs.tag }}" \
-            --repo "${{ github.repository }}" >/dev/null 2>&1
-          then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Already repackaged. Skipping."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "New version detected."
-          fi
-
-      # ============================================================
-      # 3. APK取得
-      # ============================================================
-      - name: Download upstream APK
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          curl -fL \
-            -o original.apk \
-            "${{ steps.upstream.outputs.apk_url }}"
-
-          test -s original.apk
-          ls -lh original.apk
-
-      # ============================================================
-      # 4. Java
-      # ============================================================
-      - name: Set up JDK 17
-        if: steps.check.outputs.skip == 'false'
-        uses: actions/setup-java@v4
-        with:
-          java-version: "17"
-          distribution: "temurin"
-
-      # ============================================================
-      # 5. Android SDK
-      # ============================================================
-      - name: Set up Android SDK
-        if: steps.check.outputs.skip == 'false'
-        uses: android-actions/setup-android@v3
-
-      - name: Install build-tools and apktool
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          sdkmanager \
-            "build-tools;34.0.0" \
-            --sdk_root="$ANDROID_SDK_ROOT"
-
-          APKTOOL_URL="$(
-            curl -fsSL \
-              https://api.github.com/repos/iBotPeaches/Apktool/releases/latest |
-            jq -r '
-              [
-                .assets[]
-                | select(.name | test("\\.jar$"; "i"))
-              ][0].browser_download_url
-            '
-          )"
-
-          if [ "$APKTOOL_URL" = "null" ] || [ -z "$APKTOOL_URL" ]; then
-            echo "::error::Could not find Apktool."
-            exit 1
-          fi
-
-          curl -fsSL \
-            -o apktool.jar \
-            "$APKTOOL_URL"
-
-          java -jar apktool.jar --version
-
-      # ============================================================
-      # 6. 上流APKのpackageを確認
-      # ============================================================
-      - name: Verify upstream package
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
-
-          echo "=== Upstream package ==="
-
-          "$BT/aapt" dump badging original.apk |
-            grep "^package:" || true
-
-          PACKAGE="$(
-            "$BT/aapt" dump badging original.apk |
-            sed -n "s/^package: name='\([^']*\)'.*/\1/p"
-          )"
-
-          echo "Detected: $PACKAGE"
-          echo "Expected: ${ORIGINAL_PACKAGE}"
-
-          if [ "$PACKAGE" != "${ORIGINAL_PACKAGE}" ]; then
-            echo "::error::Unexpected upstream package."
-            exit 1
-          fi
-
-      # ============================================================
-      # 7. Decompile
-      # ============================================================
-      - name: Decompile APK
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          java -jar apktool.jar \
-            d original.apk \
-            -o decoded \
-            -f
-
-      # ============================================================
-      # 8. パッケージ変更
-      #
-      # 「必要なものだけ」変更する。
-      #
-      # Java/Kotlinクラス名は変更しない。
-      # Intent actionも変更しない。
-      # ============================================================
-      - name: Patch install identity
-        if: steps.check.outputs.skip == 'false'
-        env:
-          ORIGINAL_PACKAGE: ${{ env.ORIGINAL_PACKAGE }}
-          NEW_PACKAGE: ${{ env.NEW_PACKAGE }}
-          NEW_APP_LABEL: ${{ env.NEW_APP_LABEL }}
-        run: |
-          set -euo pipefail
-
-          MANIFEST="decoded/AndroidManifest.xml"
-
-          if [ ! -f "$MANIFEST" ]; then
-            echo "::error::AndroidManifest.xml not found"
-            exit 1
-          fi
-
-          echo "=== Manifest BEFORE ==="
-          grep -nE "package=|android:authorities=|permission" "$MANIFEST" || true
-
-          # ----------------------------------------------------------
-          # 1. Manifest package
-          # ----------------------------------------------------------
-          python3 - "$MANIFEST" "$ORIGINAL_PACKAGE" "$NEW_PACKAGE" <<'PY'
-          import sys
-
-          path = sys.argv[1]
-          old = sys.argv[2]
-          new = sys.argv[3]
-
-          with open(path, "r", encoding="utf-8") as f:
-              text = f.read()
-
-          old_manifest = f'package="{old}"'
-          new_manifest = f'package="{new}"'
-
-          if old_manifest not in text:
-              raise SystemExit(
-                  f'ERROR: Manifest package "{old}" was not found'
-              )
-
-          text = text.replace(old_manifest, new_manifest, 1)
-
-          # ----------------------------------------------------------
-          # FileProvider authority
-          # ----------------------------------------------------------
-          text = text.replace(
-              f'{old}.fileprovider',
-              f'{new}.fileprovider'
-          )
-
-          text = text.replace(
-              f'{old}.FileProvider',
-              f'{new}.FileProvider'
-          )
-
-          # ----------------------------------------------------------
-          # Dynamic receiver permission
-          # ----------------------------------------------------------
-          text = text.replace(
-              f'{old}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION',
-              f'{new}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
-          )
-
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(text)
-          PY
-
-          # ----------------------------------------------------------
-          # 2. App label
-          # ----------------------------------------------------------
-          if [ -f decoded/res/values/strings.xml ]; then
-            python3 - "decoded/res/values/strings.xml" "$NEW_APP_LABEL" <<'PY'
-          import sys
-          import re
-
-          path = sys.argv[1]
-          label = sys.argv[2]
-
-          with open(path, "r", encoding="utf-8") as f:
-              text = f.read()
-
-          text, count = re.subn(
-              r'<string name="app_name">[^<]*</string>',
-              f'<string name="app_name">{label}</string>',
-              text,
-              count=1
-          )
-
-          if count:
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(text)
-          PY
-          fi
-
-          echo "=== Manifest AFTER ==="
-          grep -nE "package=|android:authorities=|permission" "$MANIFEST" || true
-
-          # ----------------------------------------------------------
-          # 3. Verify package change
-          # ----------------------------------------------------------
-          if ! grep -q "package=\"${NEW_PACKAGE}\"" "$MANIFEST"; then
-            echo "::error::Manifest package was not changed"
-            exit 1
-          fi
-
-          if grep -q "package=\"${ORIGINAL_PACKAGE}\"" "$MANIFEST"; then
-            echo "::error::Original package is still the Manifest package"
-            exit 1
-          fi
-
-          echo "Install identity patch PASSED"
-      # ============================================================
-      # 9. Rebuild
-      # ============================================================
-      - name: Rebuild APK
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          java -jar apktool.jar \
-            b decoded \
-            -o unsigned.apk
-
-          test -s unsigned.apk
-          ls -lh unsigned.apk
-
-      # ============================================================
-      # 10. 再ビルド後の package IDを確認
-      # ============================================================
-      - name: Verify rebuilt package
-        if: steps.check.outputs.skip == 'false'
-        env:
-          NEW_PACKAGE: ${{ env.NEW_PACKAGE }}
-        run: |
-          set -euo pipefail
-
-          BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
-
-          echo "=== Rebuilt APK package ==="
-
-          "$BT/aapt" dump badging unsigned.apk | grep "^package:"
-
-          PACKAGE="$(
-            "$BT/aapt" dump badging unsigned.apk |
-            awk -F"'" "/^package:/{print \$2; exit}"
-          )"
-
-          echo "Detected package: $PACKAGE"
-          echo "Expected package: $NEW_PACKAGE"
-
-          if [ "$PACKAGE" != "$NEW_PACKAGE" ]; then
-            echo "::error::Wrong APK package"
-            exit 1
-          fi
-
-          echo "Package verification PASSED"
-      # ============================================================
-      # 11. Keystore復元
-      # ============================================================
-      - name: Restore signing key
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          echo "${{ secrets.KEYSTORE_BASE64 }}" |
-            base64 -d > release.jks
-
-          test -s release.jks
-
-      # ============================================================
-      # 12. zipalign
-      # ============================================================
-      - name: Zipalign
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
-
-          "$BT/zipalign" \
-            -p \
-            -f \
-            4 \
-            unsigned.apk \
-            aligned.apk
-
-      # ============================================================
-      # 13. Sign
-      # ============================================================
-      - name: Sign APK
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          set -euo pipefail
-
-          BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
-          OUTPUT="ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk"
-
-          "$BT/apksigner" sign \
-            --ks release.jks \
-            --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
-            --out "$OUTPUT" \
-            aligned.apk
-
-          test -s "$OUTPUT"
-
-      # ============================================================
-      # 14. 最終検証
-      # ============================================================
-      - name: Final APK verification
-        if: steps.check.outputs.skip == 'false'
-        env:
-          NEW_PACKAGE: ${{ env.NEW_PACKAGE }}
-        run: |
-          set -euo pipefail
-
-          BT="$ANDROID_SDK_ROOT/build-tools/34.0.0"
-          APK="ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk"
-
-          echo "=== Final package ==="
-
-          "$BT/aapt" dump badging "$APK" | grep "^package:"
-
-          PACKAGE="$(
-            "$BT/aapt" dump badging "$APK" |
-            awk -F"'" "/^package:/{print \$2; exit}"
-          )"
-
-          echo "Detected package: $PACKAGE"
-
-          if [ "$PACKAGE" != "$NEW_PACKAGE" ]; then
-            echo "::error::Final package is wrong"
-            echo "Expected: $NEW_PACKAGE"
-            echo "Actual:   $PACKAGE"
-            exit 1
-          fi
-
-          echo
-          echo "=== Signature ==="
-
-          "$BT/apksigner" verify             --verbose             "$APK"
-
-          echo
-          echo "Final APK verification PASSED"
-      # ============================================================
-      # 15. Release公開
-      # ============================================================
-      - name: Publish to this repo's Releases
-        if: steps.check.outputs.skip == 'false'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.upstream.outputs.tag }}
-          name: "ArchiveTune Fork ${{ steps.upstream.outputs.tag }}"
-          files: |
-            ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk
+    - name: Find latest upstream release + APK asset
+      id: upstream
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: "set -euo pipefail\n\nlatest=\"$(\n  curl -fsSL \\\n    \"https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=10\"\
+        \ |\n  jq -c \"map(select(.draft == false and .prerelease == false))[0]\"\n)\"\n\nif [ \"$latest\" = \"null\" ] ||\
+        \ [ -z \"$latest\" ]; then\n  echo \"::error::No stable upstream release found.\"\n  exit 1\nfi\n\ntag=\"$(echo \"\
+        $latest\" | jq -r \".tag_name\")\"\n\n# universal APKを優先\napk_url=\"$(\n  echo \"$latest\" |\n  jq -r \"[.assets[]\
+        \ | select(.name | test(\\\"universal.*\\\\\\\\.apk$\\\"; \\\"i\\\"))][0].browser_download_url\"\n)\"\n\n# なければ任意のAPK\n\
+        if [ \"$apk_url\" = \"null\" ] || [ -z \"$apk_url\" ]; then\n  apk_url=\"$(\n    echo \"$latest\" |\n    jq -r \"\
+        [.assets[] | select(.name | test(\\\"\\\\\\\\.apk$\\\"; \\\"i\\\"))][0].browser_download_url\"\n  )\"\nfi\n\nif [\
+        \ \"$apk_url\" = \"null\" ] || [ -z \"$apk_url\" ]; then\n  echo \"::error::No APK asset found in release ${tag}\"\
+        \n  exit 1\nfi\n\necho \"tag=$tag\" >> \"$GITHUB_OUTPUT\"\necho \"apk_url=$apk_url\" >> \"$GITHUB_OUTPUT\"\n\necho\
+        \ \"Release: $tag\"\necho \"APK: $apk_url\""
+    - name: Skip if this version was already repackaged
+      id: check
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: "set -euo pipefail\n\nif gh release view \\\n  \"${{ steps.upstream.outputs.tag }}\" \\\n  --repo \"${{ github.repository\
+        \ }}\" >/dev/null 2>&1\nthen\n  echo \"skip=true\" >> \"$GITHUB_OUTPUT\"\n  echo \"Already repackaged. Skipping.\"\
+        \nelse\n  echo \"skip=false\" >> \"$GITHUB_OUTPUT\"\n  echo \"New version detected.\"\nfi\n"
+    - name: Download upstream APK
+      if: steps.check.outputs.skip == 'false'
+      run: "set -euo pipefail\n\ncurl -fL \\\n  -o original.apk \\\n  \"${{ steps.upstream.outputs.apk_url }}\"\n\ntest -s\
+        \ original.apk\nls -lh original.apk\n"
+    - name: Set up JDK 17
+      if: steps.check.outputs.skip == 'false'
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: temurin
+    - name: Set up Android SDK
+      if: steps.check.outputs.skip == 'false'
+      uses: android-actions/setup-android@v3
+    - name: Install build-tools and apktool
+      if: steps.check.outputs.skip == 'false'
+      run: "set -euo pipefail\n\nsdkmanager \\\n  \"build-tools;34.0.0\" \\\n  --sdk_root=\"$ANDROID_SDK_ROOT\"\n\nAPKTOOL_URL=\"\
+        $(\n  curl -fsSL \\\n    https://api.github.com/repos/iBotPeaches/Apktool/releases/latest |\n  jq -r '\n    [\n  \
+        \    .assets[]\n      | select(.name | test(\"\\\\.jar$\"; \"i\"))\n    ][0].browser_download_url\n  '\n)\"\n\nif\
+        \ [ \"$APKTOOL_URL\" = \"null\" ] || [ -z \"$APKTOOL_URL\" ]; then\n  echo \"::error::Could not find Apktool.\"\n\
+        \  exit 1\nfi\n\ncurl -fsSL \\\n  -o apktool.jar \\\n  \"$APKTOOL_URL\"\n\njava -jar apktool.jar --version\n"
+    - name: Verify upstream package
+      if: steps.check.outputs.skip == 'false'
+      run: "set -euo pipefail\n\nBT=\"$ANDROID_SDK_ROOT/build-tools/34.0.0\"\n\necho \"=== Upstream package ===\"\n\n\"$BT/aapt\"\
+        \ dump badging original.apk |\n  grep \"^package:\" || true\n\nPACKAGE=\"$(\n  \"$BT/aapt\" dump badging original.apk\
+        \ |\n  sed -n \"s/^package: name='\\([^']*\\)'.*/\\1/p\"\n)\"\n\necho \"Detected: $PACKAGE\"\necho \"Expected: ${ORIGINAL_PACKAGE}\"\
+        \n\nif [ \"$PACKAGE\" != \"${ORIGINAL_PACKAGE}\" ]; then\n  echo \"::error::Unexpected upstream package.\"\n  exit\
+        \ 1\nfi\n"
+    - name: Decompile APK
+      if: steps.check.outputs.skip == 'false'
+      run: "set -euo pipefail\n\njava -jar apktool.jar \\\n  d original.apk \\\n  -o decoded \\\n  -f\n"
+    - name: Patch install identity
+      if: steps.check.outputs.skip == 'false'
+      env:
+        ORIGINAL_PACKAGE: ${{ env.ORIGINAL_PACKAGE }}
+        NEW_PACKAGE: ${{ env.NEW_PACKAGE }}
+        NEW_APP_LABEL: ${{ env.NEW_APP_LABEL }}
+      run: "set -euo pipefail\n\nMANIFEST=\"decoded/AndroidManifest.xml\"\n\nif [ ! -f \"$MANIFEST\" ]; then\n  echo \"::error::AndroidManifest.xml\
+        \ not found\"\n  exit 1\nfi\n\necho \"=== Manifest BEFORE ===\"\ngrep -nE \"package=|android:authorities=|permission\"\
+        \ \"$MANIFEST\" || true\n\npython3 -c \"import sys; p=sys.argv[1]; old=sys.argv[2]; new=sys.argv[3]; text=open(p,encoding=\\\
+        \"utf-8\\\").read(); old_manifest=\\\"package=\\\\\\\"\\\"+old+\\\"\\\\\\\"\\\"; new_manifest=\\\"package=\\\\\\\"\
+        \\\"+new+\\\"\\\\\\\"\\\"; \\\nif old_manifest not in text: raise SystemExit(\\\"ERROR: Manifest package \\\\\\\"\\\
+        \"+old+\\\"\\\\\\\" was not found\\\"); \\\ntext=text.replace(old_manifest,new_manifest,1); \\\ntext=text.replace(old+\\\
+        \".fileprovider\\\",new+\\\".fileprovider\\\"); \\\ntext=text.replace(old+\\\".FileProvider\\\",new+\\\".FileProvider\\\
+        \"); \\\ntext=text.replace(old+\\\".DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\\\",new+\\\".DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION\\\
+        \"); \\\nopen(p,\\\"w\\\",encoding=\\\"utf-8\\\").write(text)\" \\\n  \"$MANIFEST\" \"$ORIGINAL_PACKAGE\" \"$NEW_PACKAGE\"\
+        \n\nif [ -f decoded/res/values/strings.xml ]; then\n  python3 -c \"import sys,re; p=sys.argv[1]; label=sys.argv[2];\
+        \ text=open(p,encoding=\\\"utf-8\\\").read(); text,count=re.subn(\\\"<string name=\\\\\\\"app_name\\\\\\\">[^<]*</string>\\\
+        \",\\\"<string name=\\\\\\\"app_name\\\\\\\">\\\"+label+\\\"</string>\\\",text,count=1); open(p,\\\"w\\\",encoding=\\\
+        \"utf-8\\\").write(text) if count else None\" \\\n    \"decoded/res/values/strings.xml\" \"$NEW_APP_LABEL\"\nfi\n\n\
+        echo \"=== Manifest AFTER ===\"\ngrep -nE \"package=|android:authorities=|permission\" \"$MANIFEST\" || true\n\nif\
+        \ ! grep -q \"package=\\\"${NEW_PACKAGE}\\\"\" \"$MANIFEST\"; then\n  echo \"::error::Manifest package was not changed\"\
+        \n  exit 1\nfi\n\nif grep -q \"package=\\\"${ORIGINAL_PACKAGE}\\\"\" \"$MANIFEST\"; then\n  echo \"::error::Original\
+        \ package is still the Manifest package\"\n  exit 1\nfi\n\necho \"Install identity patch PASSED\""
+    - name: Rebuild APK
+      if: steps.check.outputs.skip == 'false'
+      run: "set -euo pipefail\n\njava -jar apktool.jar \\\n  b decoded \\\n  -o unsigned.apk\n\ntest -s unsigned.apk\nls -lh\
+        \ unsigned.apk\n"
+    - name: Verify rebuilt package
+      if: steps.check.outputs.skip == 'false'
+      env:
+        NEW_PACKAGE: ${{ env.NEW_PACKAGE }}
+      run: "set -euo pipefail\n\nBT=\"$ANDROID_SDK_ROOT/build-tools/34.0.0\"\n\necho \"=== Rebuilt APK package ===\"\n\n\"\
+        $BT/aapt\" dump badging unsigned.apk | grep \"^package:\"\n\nPACKAGE=\"$(\n  \"$BT/aapt\" dump badging unsigned.apk\
+        \ |\n  sed -E \"s/^package: name='//; s/'.*$//\"\n)\"\n\necho \"Detected package: $PACKAGE\"\necho \"Expected package:\
+        \ $NEW_PACKAGE\"\n\nif [ \"$PACKAGE\" != \"$NEW_PACKAGE\" ]; then\n  echo \"::error::Wrong APK package\"\n  exit 1\n\
+        fi\n\necho \"Package verification PASSED\""
+    - name: Restore signing key
+      if: steps.check.outputs.skip == 'false'
+      run: "set -euo pipefail\n\necho \"${{ secrets.KEYSTORE_BASE64 }}\" |\n  base64 -d > release.jks\n\ntest -s release.jks\n"
+    - name: Zipalign
+      if: steps.check.outputs.skip == 'false'
+      run: "set -euo pipefail\n\nBT=\"$ANDROID_SDK_ROOT/build-tools/34.0.0\"\n\n\"$BT/zipalign\" \\\n  -p \\\n  -f \\\n  4\
+        \ \\\n  unsigned.apk \\\n  aligned.apk\n"
+    - name: Sign APK
+      if: steps.check.outputs.skip == 'false'
+      run: "set -euo pipefail\n\nBT=\"$ANDROID_SDK_ROOT/build-tools/34.0.0\"\nOUTPUT=\"ArchiveTuneFork-${{ steps.upstream.outputs.tag\
+        \ }}.apk\"\n\n\"$BT/apksigner\" sign \\\n  --ks release.jks \\\n  --ks-pass \"pass:${{ secrets.KEYSTORE_PASSWORD }}\"\
+        \ \\\n  --out \"$OUTPUT\" \\\n  aligned.apk\n\ntest -s \"$OUTPUT\"\n"
+    - name: Final APK verification
+      if: steps.check.outputs.skip == 'false'
+      env:
+        NEW_PACKAGE: ${{ env.NEW_PACKAGE }}
+      run: "set -euo pipefail\n\nBT=\"$ANDROID_SDK_ROOT/build-tools/34.0.0\"\nAPK=\"ArchiveTuneFork-${{ steps.upstream.outputs.tag\
+        \ }}.apk\"\n\necho \"=== Final package ===\"\n\n\"$BT/aapt\" dump badging \"$APK\" | grep \"^package:\"\n\nPACKAGE=\"\
+        $(\n  \"$BT/aapt\" dump badging \"$APK\" |\n  sed -E \"s/^package: name='//; s/'.*$//\"\n)\"\n\necho \"Detected package:\
+        \ $PACKAGE\"\n\nif [ \"$PACKAGE\" != \"$NEW_PACKAGE\" ]; then\n  echo \"::error::Final package is wrong\"\n  echo\
+        \ \"Expected: $NEW_PACKAGE\"\n  echo \"Actual:   $PACKAGE\"\n  exit 1\nfi\n\necho\necho \"=== Signature ===\"\n\n\"\
+        $BT/apksigner\" verify \\\n  --verbose \\\n  \"$APK\"\n\necho\necho \"Final APK verification PASSED\""
+    - name: Publish to this repo's Releases
+      if: steps.check.outputs.skip == 'false'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.upstream.outputs.tag }}
+        name: ArchiveTune Fork ${{ steps.upstream.outputs.tag }}
+        files: ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk
