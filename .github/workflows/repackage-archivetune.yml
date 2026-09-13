@@ -14,7 +14,7 @@ env:
   # Fork APKの package
   NEW_PACKAGE: moe.rukamori.archivetune.fork
 
-  NEW_APP_LABEL: "ArchiveTune Fork"
+  NEW_APP_LABEL: "AT-Fork"
 
 jobs:
   repackage:
@@ -68,7 +68,8 @@ jobs:
                 [
                   .assets[]
                   | select(.name | test("\\.apk$"; "i"))
-              ][0].browser_download_url
+                ][0].browser_download_url
+              '
             )"
           fi
 
@@ -241,40 +242,45 @@ jobs:
             "s/package=\"${ORIGINAL_PACKAGE}\"/package=\"${NEW_PACKAGE}\"/" \
             "$MANIFEST"
 
-          # ----------------------------------------------------------
-          # B. FileProvider authority
-          #
-          # アプリ固有のauthorityだけ変更する。
-          # クラス名は変更しない。
-          # ----------------------------------------------------------
           OLD_ESCAPED="${ORIGINAL_PACKAGE//./\\.}"
 
-          sed -i \
-            "s/${OLD_ESCAPED}\.fileprovider/${NEW_PACKAGE}.fileprovider/g" \
-            "$MANIFEST"
-
-          # 大文字 FileProvider を使うパターンにも対応
-          sed -i \
-            "s/${OLD_ESCAPED}\.FileProvider/${NEW_PACKAGE}.FileProvider/g" \
-            "$MANIFEST"
-
           # ----------------------------------------------------------
-          # C. dynamic receiver permission
+          # B. Provider authority (行単位の汎用置換)
           #
-          # これが本家とForkのインストール時競合を起こし得る。
+          # fileprovider, androidx-startup, WorkManagerのInitializer等、
+          # ContentProviderのauthorityは端末内でユニークである必要があるため、
+          # android:authorities= を含む行だけ丸ごと対象にする。
+          # クラス名(android:name)は同じ行でも他要素なので触らない設計だが、
+          # 念のため authorities 属性行だけに限定している。
           # ----------------------------------------------------------
           sed -i \
-            "s/${OLD_ESCAPED}\.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION/${NEW_PACKAGE}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION/g" \
+            "/android:authorities=/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g" \
             "$MANIFEST"
 
           # ----------------------------------------------------------
-          # D. app label
+          # C. 独自パーミッション (行単位の汎用置換)
+          #
+          # DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION などAndroidXが自動生成する
+          # 独自パーミッションは、本家とFork双方が同名で宣言すると
+          # INSTALL_FAILED_DUPLICATE_PERMISSION でどちらかのインストールが失敗する。
+          # <permission>, <uses-permission>, android:permission= の行だけを対象にする。
           # ----------------------------------------------------------
-          if [ -f decoded/res/values/strings.xml ]; then
-            sed -i \
-              "s#<string name=\"app_name\">[^<]*</string>#<string name=\"app_name\">${NEW_APP_LABEL}</string>#" \
-              decoded/res/values/strings.xml
-          fi
+          sed -i \
+            "/<permission\b/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g; \
+             /<uses-permission\b/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g; \
+             /android:permission=/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g" \
+            "$MANIFEST"
+
+          # ----------------------------------------------------------
+          # D. app label (全ロケールのstrings.xmlに反映)
+          # ----------------------------------------------------------
+          while IFS= read -r -d '' f; do
+            if grep -q '<string name="app_name">' "$f"; then
+              sed -i \
+                "s#<string name=\"app_name\">[^<]*</string>#<string name=\"app_name\">${NEW_APP_LABEL}</string>#" \
+                "$f"
+            fi
+          done < <(find decoded/res -type f -name strings.xml -print0)
 
           echo "=== Manifest AFTER ==="
           grep -nE \
