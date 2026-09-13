@@ -295,17 +295,33 @@ jobs:
 
           echo "Updater repository: ${fork_owner}/${fork_repo}"
 
+          # Patch every smali file, not only Updater.smali.
+          # The verification below scans the entire smali tree, so every
+          # known upstream updater reference must be replaced wherever it occurs.
           while IFS= read -r -d '' file; do
+            changed=false
+
+            if grep -qE 'GITHUB_OWNER|GITHUB_REPO|RELEASE_GITHUB_OWNER|RELEASE_GITHUB_REPO' "$file"; then
+              sed -i \
+                -e "s/\"rukamori\"/\"${fork_owner}\"/g" \
+                -e "s/\"ArchiveTune\"/\"${fork_repo}\"/g" \
+                "$file"
+              changed=true
+            fi
+
             if grep -qE \
-              'GITHUB_OWNER|GITHUB_REPO|RELEASE_GITHUB_OWNER|RELEASE_GITHUB_REPO' \
-              "$file"
-            then
+              'https://api\.github\.com/repos/rukamori/ArchiveTune/commits|https://github\.com/rukamori/ArchiveTune/releases|https://nightly\.link/rukamori/ArchiveTune/' \
+              "$file"; then
               sed -i \
-                -e "s/\"rukamori\"/\"${fork_owner}\"/g" \
-                -e "s/\"ArchiveTune\"/\"${fork_repo}\"/g" \
+                -e "s#https://api\.github\.com/repos/rukamori/ArchiveTune/commits#https://api.github.com/repos/${fork_owner}/${fork_repo}/commits#g" \
+                -e "s#https://github\.com/rukamori/ArchiveTune/releases#https://github.com/${fork_owner}/${fork_repo}/releases#g" \
+                -e "s#https://nightly\.link/rukamori/ArchiveTune/#https://nightly.link/${fork_owner}/${fork_repo}/#g" \
                 "$file"
+              changed=true
+            fi
 
-              echo "Patched BuildConfig repository constants: $file"
+            if [ "$changed" = true ]; then
+              echo "Patched updater references: $file"
             fi
           done < <(
             find decoded/smali* \
@@ -314,25 +330,8 @@ jobs:
               -print0 2>/dev/null || true
           )
 
-          while IFS= read -r -d '' file; do
-            if [[ "$file" == *"/Updater.smali" ]]; then
-              sed -i \
-                -e "s#https://api\\.github\\.com/repos/rukamori/ArchiveTune/commits#https://api.github.com/repos/${fork_owner}/${fork_repo}/commits#g" \
-                -e "s#https://github\\.com/rukamori/ArchiveTune/releases#https://github.com/${fork_owner}/${fork_repo}/releases#g" \
-                -e "s#https://nightly\\.link/rukamori/ArchiveTune/#https://nightly.link/${fork_owner}/${fork_repo}/#g" \
-                -e "s/\"rukamori\"/\"${fork_owner}\"/g" \
-                -e "s/\"ArchiveTune\"/\"${fork_repo}\"/g" \
-                "$file"
-
-              echo "Patched Updater.smali: $file"
-            fi
-          done < <(
-            find decoded/smali* \
-              -type f \
-              -name '*.smali' \
-              -print0 2>/dev/null || true
-          )
-
+          # Fail only if an actual upstream updater endpoint remains anywhere
+          # in the decoded smali tree after the replacement pass.
           if grep -Rqs \
             -e 'https://api.github.com/repos/rukamori/ArchiveTune/commits' \
             -e 'https://github.com/rukamori/ArchiveTune/releases' \
@@ -340,6 +339,12 @@ jobs:
             decoded/smali* 2>/dev/null
           then
             echo "::error::An upstream updater URL remains in smali."
+            echo "Remaining references:"
+            grep -RIn \
+              -e 'https://api.github.com/repos/rukamori/ArchiveTune/commits' \
+              -e 'https://github.com/rukamori/ArchiveTune/releases' \
+              -e 'https://nightly.link/rukamori/ArchiveTune/' \
+              decoded/smali* 2>/dev/null || true
             exit 1
           fi
 
@@ -375,7 +380,7 @@ jobs:
             --no-input \
             pillow
 
-          python3 - \
+          python3 \
             "${FORK_PACKAGE}" \
             "${GITHUB_REPOSITORY}" \
             "decoded/AndroidManifest.xml" \
@@ -961,26 +966,7 @@ jobs:
             "app-gms-mobile-${{ steps.upstream.outputs.architecture }}-release.apk" \
             --repo "$GITHUB_REPOSITORY" \
             --title "AT-Fork ${{ steps.upstream.outputs.tag }}" \
-            --notes "
-          Repackaged from upstream ArchiveTune.
-
-          Upstream:
-          https://github.com/rukamori/ArchiveTune
-
-          Fork package:
-          ${FORK_PACKAGE}
-
-          The default launcher icon remains the upstream ArchiveTune icon.
-
-          Community icons uploaded to:
-          ${ICON_DIR}/
-
-          are embedded into the APK and can be selected from ArchiveTune's
-          built-in app icon picker.
-
-          The release tag intentionally matches the upstream version so the
-          in-app updater can compare semantic versions correctly.
-          "
+            --notes $'Repackaged from upstream ArchiveTune.\n\nUpstream:\nhttps://github.com/rukamori/ArchiveTune\n\nFork package:\n${FORK_PACKAGE}\n\nThe default launcher icon remains the upstream ArchiveTune icon.\n\nCommunity icons uploaded to:\n${ICON_DIR}/\n\nare embedded into the APK and can be selected from ArchiveTune\'s\nbuilt-in app icon picker.\n\nThe release tag intentionally matches the upstream version so the\nin-app updater can compare semantic versions correctly.'
 
       - name: Write SHA256
         if: steps.guard.outputs.run == 'true'
