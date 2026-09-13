@@ -380,7 +380,7 @@ jobs:
             --no-input \
             pillow
 
-          python3 \
+          python3 - \
             "${FORK_PACKAGE}" \
             "${GITHUB_REPOSITORY}" \
             "decoded/AndroidManifest.xml" \
