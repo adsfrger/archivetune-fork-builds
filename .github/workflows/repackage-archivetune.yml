@@ -375,7 +375,7 @@ jobs:
             --no-input \
             pillow
 
-          python3 \
+          python3 - \
             "${FORK_PACKAGE}" \
             "${GITHUB_REPOSITORY}" \
             "decoded/AndroidManifest.xml" \
@@ -962,25 +962,25 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "AT-Fork ${{ steps.upstream.outputs.tag }}" \
             --notes "
-Repackaged from upstream ArchiveTune.
+          Repackaged from upstream ArchiveTune.
 
-Upstream:
-https://github.com/rukamori/ArchiveTune
+          Upstream:
+          https://github.com/rukamori/ArchiveTune
 
-Fork package:
-${FORK_PACKAGE}
+          Fork package:
+          ${FORK_PACKAGE}
 
-The default launcher icon remains the upstream ArchiveTune icon.
+          The default launcher icon remains the upstream ArchiveTune icon.
 
-Community icons uploaded to:
-${ICON_DIR}/
+          Community icons uploaded to:
+          ${ICON_DIR}/
 
-are embedded into the APK and can be selected from ArchiveTune's
-built-in app icon picker.
+          are embedded into the APK and can be selected from ArchiveTune's
+          built-in app icon picker.
 
-The release tag intentionally matches the upstream version so the
-in-app updater can compare semantic versions correctly.
-"
+          The release tag intentionally matches the upstream version so the
+          in-app updater can compare semantic versions correctly.
+          "
 
       - name: Write SHA256
         if: steps.guard.outputs.run == 'true'
