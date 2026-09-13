@@ -233,7 +233,7 @@ jobs:
           fi
 
           echo "=== Manifest BEFORE ==="
-          grep -nE 'package=|android:authorities=|permission' "$MANIFEST" || true
+          grep -nE "package=|android:authorities=|permission" "$MANIFEST" || true
 
           # ----------------------------------------------------------
           # 1. Manifest package
@@ -311,7 +311,7 @@ jobs:
           fi
 
           echo "=== Manifest AFTER ==="
-          grep -nE 'package=|android:authorities=|permission' "$MANIFEST" || true
+          grep -nE "package=|android:authorities=|permission" "$MANIFEST" || true
 
           # ----------------------------------------------------------
           # 3. Verify package change
@@ -356,11 +356,11 @@ jobs:
 
           echo "=== Rebuilt APK package ==="
 
-          "$BT/aapt" dump badging unsigned.apk | grep '^package:'
+          "$BT/aapt" dump badging unsigned.apk | grep "^package:"
 
           PACKAGE="$(
             "$BT/aapt" dump badging unsigned.apk |
-            awk -F"'" '/^package:/{print $2; exit}'
+            awk -F"'" "/^package:/{print \$2; exit}"
           )"
 
           echo "Detected package: $PACKAGE"
@@ -436,11 +436,11 @@ jobs:
 
           echo "=== Final package ==="
 
-          "$BT/aapt" dump badging "$APK" | grep '^package:'
+          "$BT/aapt" dump badging "$APK" | grep "^package:"
 
           PACKAGE="$(
             "$BT/aapt" dump badging "$APK" |
-            awk -F"'" '/^package:/{print $2; exit}'
+            awk -F"'" "/^package:/{print \$2; exit}"
           )"
 
           echo "Detected package: $PACKAGE"
