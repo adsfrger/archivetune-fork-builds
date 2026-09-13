@@ -25,7 +25,18 @@ jobs:
 
     steps:
       # ============================================================
-      # 1. 最新の安定版Releaseを取得
+      # 1. 最新の安定版Releaseを取得し、正しいアセットを選ぶ
+      #
+      # ArchiveTuneには GMS版(Cast/GoogleSignIn等を含む) と
+      # FOSS版(それらを除いたビルド)、さらに mobile版/tv版が
+      # 混在してリリースされている。
+      #
+      # 優先順位:
+      #   1. app-gms-mobile-universal-release.apk (全ABI・GMS機能フル)
+      #   2. app-gms-mobile-arm64-release.apk      (universalが無い場合の保険)
+      #   3. それ以外の app-gms-mobile-*.apk        (さらに保険)
+      #
+      # foss / tv は絶対に選ばない。
       # ============================================================
       - name: Find latest upstream release + APK asset
         id: upstream
@@ -49,40 +60,38 @@ jobs:
 
           tag="$(echo "$latest" | jq -r '.tag_name')"
 
-          # universal APKを優先
-          apk_url="$(
+          asset="$(
             echo "$latest" |
-            jq -r '
-              [
-                .assets[]
-                | select(.name | test("universal.*\\.apk$"; "i"))
-              ][0].browser_download_url
+            jq -c '
+              (.assets | map(select(.name == "app-gms-mobile-universal-release.apk")))[0] //
+              (.assets | map(select(.name == "app-gms-mobile-arm64-release.apk")))[0] //
+              (.assets | map(select(.name | test("^app-gms-mobile-.*\\.apk$"))))[0] //
+              null
             '
           )"
 
-          # なければ任意のAPK
-          if [ "$apk_url" = "null" ] || [ -z "$apk_url" ]; then
-            apk_url="$(
-              echo "$latest" |
-              jq -r '
-                [
-                  .assets[]
-                  | select(.name | test("\\.apk$"; "i"))
-                ][0].browser_download_url
-              '
-            )"
-          fi
-
-          if [ "$apk_url" = "null" ] || [ -z "$apk_url" ]; then
-            echo "::error::No APK asset found in release ${tag}"
+          if [ "$asset" = "null" ] || [ -z "$asset" ]; then
+            echo "::error::No GMS mobile APK asset found in release ${tag}"
+            echo "::error::Available assets:"
+            echo "$latest" | jq -r '.assets[].name'
             exit 1
           fi
 
+          apk_name="$(echo "$asset" | jq -r '.name')"
+          apk_url="$(echo "$asset" | jq -r '.browser_download_url')"
+          apk_digest="$(echo "$asset" | jq -r '.digest // empty')"
+
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "apk_name=$apk_name" >> "$GITHUB_OUTPUT"
           echo "apk_url=$apk_url" >> "$GITHUB_OUTPUT"
+          echo "apk_digest=$apk_digest" >> "$GITHUB_OUTPUT"
 
           echo "Release: $tag"
+          echo "Selected asset: $apk_name"
           echo "APK: $apk_url"
+          if [ -n "$apk_digest" ]; then
+            echo "Expected digest: $apk_digest"
+          fi
 
       # ============================================================
       # 2. 既に処理済みなら終了
@@ -106,12 +115,14 @@ jobs:
           fi
 
       # ============================================================
-      # 3. APK取得
+      # 3. APK取得 + 整合性検証
       # ============================================================
       - name: Download upstream APK
         if: steps.check.outputs.skip == 'false'
         run: |
           set -euo pipefail
+
+          echo "Downloading: ${{ steps.upstream.outputs.apk_name }}"
 
           curl -fL \
             -o original.apk \
@@ -119,6 +130,20 @@ jobs:
 
           test -s original.apk
           ls -lh original.apk
+
+          EXPECTED="${{ steps.upstream.outputs.apk_digest }}"
+          if [ -n "$EXPECTED" ]; then
+            ACTUAL="sha256:$(sha256sum original.apk | awk '{print $1}')"
+            echo "Expected: $EXPECTED"
+            echo "Actual:   $ACTUAL"
+            if [ "$EXPECTED" != "$ACTUAL" ]; then
+              echo "::error::SHA256 mismatch! Download may be corrupted or tampered."
+              exit 1
+            fi
+            echo "Checksum verification PASSED."
+          else
+            echo "No digest metadata from GitHub API; skipping checksum verification."
+          fi
 
       # ============================================================
       # 4. Java
@@ -250,8 +275,6 @@ jobs:
           # fileprovider, androidx-startup, WorkManagerのInitializer等、
           # ContentProviderのauthorityは端末内でユニークである必要があるため、
           # android:authorities= を含む行だけ丸ごと対象にする。
-          # クラス名(android:name)は同じ行でも他要素なので触らない設計だが、
-          # 念のため authorities 属性行だけに限定している。
           # ----------------------------------------------------------
           sed -i \
             "/android:authorities=/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g" \
@@ -263,7 +286,6 @@ jobs:
           # DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION などAndroidXが自動生成する
           # 独自パーミッションは、本家とFork双方が同名で宣言すると
           # INSTALL_FAILED_DUPLICATE_PERMISSION でどちらかのインストールが失敗する。
-          # <permission>, <uses-permission>, android:permission= の行だけを対象にする。
           # ----------------------------------------------------------
           sed -i \
             "/<permission\b/ s/${OLD_ESCAPED}\./${NEW_PACKAGE}./g; \
@@ -345,7 +367,25 @@ jobs:
           echo "Package verification PASSED."
 
       # ============================================================
-      # 11. Keystore復元
+      # 11. GMS機能(Cast/SignIn)がちゃんと含まれているか確認
+      # ============================================================
+      - name: Verify GMS features are present
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+
+          MANIFEST="decoded/AndroidManifest.xml"
+
+          if ! grep -q "com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME" "$MANIFEST"; then
+            echo "::error::Cast support is missing from this build."
+            echo "::error::Check that the selected upstream asset is the GMS variant, not FOSS."
+            exit 1
+          fi
+
+          echo "GMS Cast support confirmed present."
+
+      # ============================================================
+      # 12. Keystore復元
       # ============================================================
       - name: Restore signing key
         if: steps.check.outputs.skip == 'false'
@@ -358,7 +398,7 @@ jobs:
           test -s release.jks
 
       # ============================================================
-      # 12. zipalign
+      # 13. zipalign
       # ============================================================
       - name: Zipalign
         if: steps.check.outputs.skip == 'false'
@@ -375,7 +415,7 @@ jobs:
             aligned.apk
 
       # ============================================================
-      # 13. Sign
+      # 14. Sign
       # ============================================================
       - name: Sign APK
         if: steps.check.outputs.skip == 'false'
@@ -394,7 +434,7 @@ jobs:
           test -s "$OUTPUT"
 
       # ============================================================
-      # 14. 最終検証
+      # 15. 最終検証
       # ============================================================
       - name: Final APK verification
         if: steps.check.outputs.skip == 'false'
@@ -429,11 +469,12 @@ jobs:
           echo
           echo "========================================"
           echo " ArchiveTune Fork verification PASSED"
+          echo " Source asset: ${{ steps.upstream.outputs.apk_name }}"
           echo " Package: $PACKAGE"
           echo "========================================"
 
       # ============================================================
-      # 15. Release公開
+      # 16. Release公開
       # ============================================================
       - name: Publish to this repo's Releases
         if: steps.check.outputs.skip == 'false'
@@ -441,5 +482,7 @@ jobs:
         with:
           tag_name: ${{ steps.upstream.outputs.tag }}
           name: "ArchiveTune Fork ${{ steps.upstream.outputs.tag }}"
+          body: |
+            Repackaged from upstream asset: `${{ steps.upstream.outputs.apk_name }}`
           files: |
             ArchiveTuneFork-${{ steps.upstream.outputs.tag }}.apk
